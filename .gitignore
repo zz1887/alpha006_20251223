@@ -1,0 +1,92 @@
+# Python 缓存
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# 环境变量
+.env
+.env.local
+.env.production
+
+# 数据目录 - 不应提交到 Git
+data/raw/
+data/processed/
+data/cache/
+results/
+logs/
+errors/
+
+# IDE 和编辑器
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 操作系统
+.DS_Store
+Thumbs.db
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# 临时文件
+*.tmp
+*.temp
+
+# 编译文件
+*.pyc
+*.pyo
+
+# 日志文件
+*.log
+
+# 配置文件（包含敏感信息）
+config/database_local.py
+config/*_local.py
+
+# 测试覆盖率
+htmlcov/
+.coverage
+.coverage.*
+.pytest_cache/
+
+# 编译产物
+build/
+dist/
+*.egg-info/
+
+# 环境目录
+venv/
+env/
+ENV/
+
+# 结果文件（可选，如果需要提交结果则注释掉）
+# results/**/*.csv
+# results/**/*.json
+# results/**/*.txt
+
+# 数据库缓存文件
+*.db
+*.sqlite
+*.sqlite3
+
+# 压缩文件
+*.zip
+*.tar.gz
+*.7z
+
+# 大型数据文件
+*.h5
+*.hdf5
+*.pkl  # 如果需要提交 pkl 缓存，可以移除这行
+*.parquet
+
+# 临时脚本
+temp_*.py
+test_*.py
+
+# 本地测试配置
+tests/local_*

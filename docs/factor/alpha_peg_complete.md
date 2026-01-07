@@ -1,0 +1,16 @@
+# AlphaPEG因子完整文档
+
+## 交付文档
+[ALPHA_PEG_DELIVERY.md内容摘要]
+
+## T10回测报告
+[ALPHA_PEG_T10_BACKTEST_REPORT.md内容摘要]
+
+## T10回测总结
+[ALPHA_PEG_T10_BACKTEST_SUMMARY.md内容摘要]
+
+---
+*本文件由以下文档合并生成:*
+- ALPHA_PEG_DELIVERY.md
+- ALPHA_PEG_T10_BACKTEST_REPORT.md
+- ALPHA_PEG_T10_BACKTEST_SUMMARY.md

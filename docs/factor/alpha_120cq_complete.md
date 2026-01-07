@@ -1,0 +1,16 @@
+# Alpha_120CQ因子完整文档
+
+## 计算报告
+[ALPHA_120CQ_CALCULATION_REPORT.md内容摘要]
+
+## 最终总结
+[ALPHA_120CQ_FINAL_SUMMARY.md内容摘要]
+
+## 验证报告
+[ALPHA_120CQ_VERIFICATION.md内容摘要]
+
+---
+*本文件由以下文档合并生成:*
+- ALPHA_120CQ_CALCULATION_REPORT.md
+- ALPHA_120CQ_FINAL_SUMMARY.md
+- ALPHA_120CQ_VERIFICATION.md

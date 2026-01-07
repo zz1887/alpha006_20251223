@@ -1,0 +1,1757 @@
+# 选股策略（修复股票池获取错误版）
+# 修复内容：
+# 1. 解决"参数必须是个字符串"错误
+# 2. 优化股票池筛选条件，避免出现空股票池
+# 3. 增强参数类型检查和错误处理
+
+from jqfactor import get_factor_values
+import talib as ta
+import pandas as pd
+import numpy as np
+from jqdata import *
+import time
+from datetime import datetime, date
+import math
+from typing import Any, Dict
+from functools import lru_cache
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# 全局配置
+MAX_WORKERS = 4  # 线程池最大线程数
+CACHE_SIZE = 128  # 缓存大小
+
+
+# ==================== 工具函数模块 ====================
+def to_datetime(input_date, field_name="未指定"):
+    """日期转换工具函数，统一转换为datetime格式"""
+    try:
+        if input_date is None:
+            raise ValueError(f"日期不能为空（{field_name}）")
+            
+        if isinstance(input_date, datetime):
+            return input_date.replace(hour=0, minute=0, second=0, microsecond=0)
+        if isinstance(input_date, date):
+            return datetime.combine(input_date, datetime.min.time())
+        if isinstance(input_date, str):
+            # 确保字符串不为空
+            if not input_date.strip():
+                raise ValueError(f"日期字符串不能为空（{field_name}）")
+                
+            for fmt in ['%Y-%m-%d', '%Y%m%d', '%Y/%m/%d']:
+                try:
+                    return datetime.strptime(input_date, fmt).replace(hour=0, minute=0, second=0, microsecond=0)
+                except ValueError:
+                    continue
+            raise ValueError(f"无法解析字符串日期: {input_date}")
+        raise TypeError(f"不支持的日期类型: {type(input_date)}")
+    except Exception as e:
+        raise type(e)(f"日期转换失败（{field_name}）: {str(e)}")
+
+
+def to_date_str(input_date, field_name="未指定"):
+    """将日期转换为字符串格式 '%Y-%m-%d'"""
+    try:
+        dt = to_datetime(input_date, field_name)
+        return dt.strftime('%Y-%m-%d')
+    except:
+        # 作为最后的 fallback，返回一个默认日期字符串
+        log.warning(f"无法转换日期 {input_date} 为字符串，使用默认日期")
+        return '2020-01-01'
+
+
+def calc_ma_slope(ma_series, window=10):
+    """计算均线斜率（角度制）"""
+    if len(ma_series) < window:
+        return 0.0
+    try:
+        x = np.arange(window)
+        y = ma_series[-window:].values
+        slope, _ = np.polyfit(x, y, 1)
+        return np.degrees(np.arctan(slope / (ma_series[-1] + 1e-6) * 100))
+    except:
+        return 0.0
+
+
+def get_common_stocks(list1, list2):
+    """获取两个股票列表的交集，确保代码存在性"""
+    return list(set(list1) & set(list2))
+
+
+def calculate_valid_quantity(target_value, current_price, min_lot=100, min_commission=5, commission_rate=0.0015):
+    """计算符合规则的下单数量（100的整数倍且大于0），考虑最低佣金"""
+    if current_price <= 0 or target_value <= 0:
+        return 0
+        
+    # 计算基础数量
+    base_quantity = target_value / current_price
+    lot_quantity = int(base_quantity / min_lot) * min_lot
+    
+    # 检查佣金：若佣金>交易金额1%，增加数量
+    while lot_quantity > 0:
+        trade_value = lot_quantity * current_price
+        commission = max(trade_value * commission_rate, min_commission)
+        if commission / trade_value <= 0.01:  # 佣金≤1%
+            break
+        lot_quantity += min_lot  # 增加1手，降低佣金占比
+    
+    # 确保数量至少为1手
+    if lot_quantity < min_lot:
+        required_value = min_lot * current_price
+        required_commission = max(required_value * commission_rate, min_commission)
+        if required_value + required_commission <= target_value * 1.05:  # 允许5%的价格波动
+            return min_lot
+        return 0
+        
+    return lot_quantity
+
+
+@lru_cache(maxsize=CACHE_SIZE)
+def get_industry_code(stock, date):
+    """获取股票行业代码（优化：优先申万一级→证监会行业→默认）"""
+    try:
+        # 确保date是字符串类型
+        date_str = to_date_str(date, "行业代码查询日期")
+        industry_data = get_industry(stock, date=date_str)
+        if not industry_data or stock not in industry_data:
+            return "未知行业"
+        # 1. 优先申万一级
+        if 'sw_l1' in industry_data[stock]:
+            return industry_data[stock]['sw_l1']['industry_name']
+        # 2. 其次证监会行业
+        elif 'zjw' in industry_data[stock]:
+            return industry_data[stock]['zjw']['industry_name']
+        # 3. 最后取第一个行业
+        else:
+            return list(industry_data[stock].values())[0]['industry_name']
+    except Exception as e:
+        log.warning(f"获取{stock}行业代码失败: {str(e)}")
+        return "未知行业"
+
+
+def get_market_state(index_code, price_data):
+    """判断市场状态：上涨/下跌/震荡，高波动/低波动"""
+    if price_data is None or len(price_data) < 60:
+        return "neutral"  # 数据不足时默认中性
+    
+    # 指数均线趋势判断
+    index_close = price_data['close']
+    index_ma60 = ta.SMA(index_close.values, 60)
+    index_ma20 = ta.SMA(index_close.values, 20)
+    is_uptrend = index_ma20[-1] > index_ma60[-1] and index_close.iloc[-1] > index_ma20[-1]
+    is_downtrend = index_ma20[-1] < index_ma60[-1] and index_close.iloc[-1] < index_ma20[-1]
+    
+    # 波动率判断（最近30天振幅）
+    recent_30d = index_close.tail(30)
+    volatility = (recent_30d.max() - recent_30d.min()) / recent_30d.min() * 100
+    is_high_vol = volatility > 15  # 波动率>15%视为高波动
+    
+    if is_downtrend:
+        return "downtrend_high_vol" if is_high_vol else "downtrend_low_vol"
+    elif is_uptrend:
+        return "uptrend_high_vol" if is_high_vol else "uptrend_low_vol"
+    else:
+        return "neutral"
+
+def get_total_market_stocks(context):
+    """获取全市场股票数量（适用于聚宽平台）"""
+    try:
+        # 获取当前所有上市的股票（排除退市、暂停上市的）
+        all_stocks = get_all_securities('stock', context.current_dt)
+        # 返回股票数量
+        return len(all_stocks)
+    except Exception as e:
+        # 若获取失败，返回一个默认值（如3000）
+        log.warning(f"获取全市场股票数量失败: {e}，使用默认值3000")
+        return 3000
+
+def get_first_trading_day(year, month):
+    """获取指定年月的第一个交易日（排除周末和节假日）"""
+    from datetime import datetime, timedelta
+    
+    # 构造当月第一天
+    first_day = datetime(year, month, 1)
+    
+    # 循环查找第一个交易日（非周末且有交易数据）
+    current_day = first_day
+    max_attempts = 10  # 最多检查10天（避免无限循环）
+    attempts = 0
+    
+    while attempts < max_attempts:
+        # 跳过周末（周六=5，周日=6）
+        if current_day.weekday() >= 5:
+            current_day += timedelta(days=1)
+            attempts += 1
+            continue
+        
+        # 尝试获取当天的指数数据（有数据说明是交易日）
+        try:
+            # 用创业板指判断（也可用上证指数）
+            date_str = current_day.strftime('%Y-%m-%d')
+            # 获取当天的价格数据（若返回空，说明非交易日）
+            price_data = get_price('399006.XSHE', start_date=date_str, end_date=date_str, frequency='daily')
+            if not price_data.empty:
+                return current_day  # 找到第一个交易日
+        except Exception:
+            pass  # 获取数据失败，视为非交易日
+        
+        current_day += timedelta(days=1)
+        attempts += 1
+    
+    # 若超过尝试次数仍未找到，返回当月第一天（降级处理）
+    return first_day
+
+# ==================== 数据获取模块（批量优化版） ====================
+def is_kcb_stock(stock_code):
+    """判断是否为科创板股票（688开头的沪市股票）"""
+    return stock_code.startswith('688') and stock_code.endswith('.XSHG')
+
+
+def get_stock_pool(context, debug, is_mainboard=False, min_listed_days=365):
+    """统一获取股票池（修复创业板301开头股票识别）"""
+    try:
+        # 1. 日期参数处理（确保字符串类型）
+        query_dt = context.current_dt
+        if query_dt is None:
+            query_date_str = datetime.now().strftime('%Y-%m-%d')
+            log.warning(f"当前日期为空，使用系统日期: {query_date_str}")
+        else:
+            query_date_str = to_date_str(query_dt, "股票池查询日期")
+        
+        if not isinstance(query_date_str, str) or len(query_date_str.strip()) == 0:
+            raise TypeError(f"日期转换失败，结果不是有效字符串: {query_date_str}")
+        
+        pool_type = "主板" if is_mainboard else "创业板"
+        if debug:
+            log.debug(f"获取{pool_type}股票池：日期={query_date_str}（类型：{type(query_date_str)}）")
+
+        # 2. 批量获取全量证券信息（一次请求替代循环，核心提速点）
+        all_sec_info = get_all_securities(types=['stock'], date=query_date_str)
+        if all_sec_info.empty:
+            log.warning(f"{pool_type}全量证券信息为空，尝试默认日期")
+            all_sec_info = get_all_securities(types=['stock'], date='2023-01-01')
+            if all_sec_info.empty:
+                log.error(f"{pool_type}股票数据获取失败")
+                return []
+
+        # 3. 筛选创业板/主板股票（修复创业板代码识别）
+        if is_mainboard:
+            # 主板：排除创业板(300/301开头)和科创板(688开头)
+            mask = ~(
+                # 排除创业板（300和301开头，深交所）
+                ((all_sec_info.index.str.startswith('300') | all_sec_info.index.str.startswith('301')) & 
+                 all_sec_info.index.str.endswith('.XSHE')) |
+                # 排除科创板（688开头，上交所）
+                (all_sec_info.index.str.startswith('688') & all_sec_info.index.str.endswith('.XSHG'))
+            )
+        else:
+            # 创业板：包含300开头和301开头且深交所上市的股票
+            mask = (
+                (all_sec_info.index.str.startswith('300') | all_sec_info.index.str.startswith('301')) & 
+                all_sec_info.index.str.endswith('.XSHE') &
+                ~all_sec_info.index.str.startswith('688')  # 排除科创板
+            )
+            
+        candidate_stocks = all_sec_info[mask].index.tolist()
+        if not candidate_stocks:
+            log.warning(f"{pool_type}初始筛选后无股票，放宽上市时间要求")
+            min_listed_days = max(180, min_listed_days // 2)
+
+        # 4. 批量提取上市日期（从全量信息中直接获取，无需再次调用API）
+        qualified_stocks = []
+        for code in candidate_stocks:
+            try:
+                start_date = all_sec_info.loc[code]['start_date']
+                listed_days = (query_dt.date() - start_date).days
+                
+                # 仅保留上市时间达标且非ST的股票
+                if listed_days >= min_listed_days:
+                    sec_name = all_sec_info.loc[code]['display_name']
+                    if not sec_name.startswith(('ST', '*ST')):
+                        qualified_stocks.append(code)
+            except Exception as e:
+                if debug:
+                    log.debug(f"筛选{code}时出错: {str(e)}")
+                continue
+
+        # 5. 结果统计与日志
+        excluded_count = len(candidate_stocks) - len(qualified_stocks)
+        if excluded_count > 0 and debug:
+            log.debug(f"排除不符合条件股票共{excluded_count}只")
+            
+        log.info(f"{pool_type}股票池：原始{len(candidate_stocks)}只，筛选后{len(qualified_stocks)}只")
+        return qualified_stocks
+
+    except Exception as e:
+        error_detail = f"获取{pool_type}股票池失败: {str(e)}"
+        if 'query_dt' in locals():
+            error_detail += f"，query_dt类型: {type(query_dt)}"
+        if 'candidate_stocks' in locals() and candidate_stocks:
+            error_detail += f"，股票代码示例类型: {type(candidate_stocks[0])}"
+        log.error(error_detail)
+        return []
+
+def batch_get_price_data(stocks, end_dt, max_days, debug, batch_size=200):
+    """批量获取价格相关数据（优化批次处理、错误重试和长期停牌股排除）"""
+    try:
+        # 确保日期是字符串类型
+        end_date_str = to_date_str(end_dt, "价格数据查询日期")
+        if debug:
+            log.debug(f"获取价格数据：日期={end_date_str}，股票数量={len(stocks)}")
+        
+        if not stocks:
+            return None
+            
+        all_price_dfs = []
+        total_batches = math.ceil(len(stocks) / batch_size)
+        
+        for i in range(0, len(stocks), batch_size):
+            batch = stocks[i:i+batch_size]
+            batch_num = i//batch_size + 1
+            
+            try:
+                # 批量获取多股票价格数据
+                price_df = get_price(
+                    batch,
+                    end_date=end_date_str,
+                    frequency='daily',
+                    fields=['close', 'volume', 'high', 'low'],
+                    count=max_days + 20,  # 多获取20天用于填充
+                    skip_paused=False,
+                    panel=False
+                )
+                
+                if not price_df.empty:
+                    all_price_dfs.append(price_df)
+                
+                # 动态调整批次间延迟，避免API限制
+                if total_batches > 5 and batch_num % 5 == 0:
+                    time.sleep(1)
+                else:
+                    time.sleep(0.3)
+                    
+            except Exception as e:
+                log.warning(f"价格数据批次{batch_num}获取失败，重试: {str(e)}")
+                # 失败重试机制
+                for retry in range(2):
+                    try:
+                        time.sleep(1.5 * (retry + 1))
+                        price_df = get_price(
+                            batch,
+                            end_date=end_date_str,
+                            frequency='daily',
+                            fields=['close', 'volume', 'high', 'low'],
+                            count=max_days + 20,
+                            skip_paused=False,
+                            panel=False
+                        )
+                        if not price_df.empty:
+                            all_price_dfs.append(price_df)
+                        log.debug(f"价格数据批次{batch_num}重试{retry+1}次成功")
+                        break
+                    except Exception as e2:
+                        log.warning(f"价格数据批次{batch_num}重试{retry+1}次失败: {str(e2)}")
+        
+        if not all_price_dfs:
+            log.warning("价格数据返回为空")
+            return None
+            
+        # 合并所有批次数据
+        price_df = pd.concat(all_price_dfs, ignore_index=True)
+        
+        # 转换为透视表格式（日期×股票代码）
+        price_data = {
+            field: price_df.pivot(index='time', columns='code', values=field)
+            for field in ['close', 'volume', 'high', 'low']
+        }
+        
+        # 数据清洗
+        for field in price_data:
+            price_data[field] = price_data[field].fillna(method='ffill', limit=3).fillna(method='bfill', limit=3)
+        
+        # 排除近20天停牌≥5天的股票
+        if price_data:
+            close_data = price_data['close']
+            # 计算近20天停牌天数（价格不变且成交量为0）
+            recent_20d_close = close_data.tail(20)
+            recent_20d_volume = price_data['volume'].tail(20)
+            suspension_days = ((recent_20d_close.diff() == 0) & (recent_20d_volume == 0)).sum(axis=0)
+            # 保留停牌≤5天的股票
+            valid_stocks = suspension_days[suspension_days <= 5].index.tolist()
+            for field in price_data:
+                price_data[field] = price_data[field][valid_stocks]
+            log.debug(f"排除长期停牌股后，剩余股票：{len(valid_stocks)}只")
+            
+        return price_data
+    except Exception as e:
+        log.error(f"价格数据获取失败: {str(e)}")
+        return None
+
+def get_turnover_data(stocks, end_dt, max_days, debug, batch_size=150):
+    """获取换手率数据（批量优化版）"""
+    try:
+        # 确保日期是字符串类型
+        query_date_str = to_date_str(end_dt, "换手率查询日期")
+        if debug:
+            log.debug(f"获取换手率数据：日期={query_date_str}，股票数量={len(stocks)}")
+        
+        if not stocks:
+            return pd.DataFrame()
+            
+        all_dfs = []
+        total_batches = math.ceil(len(stocks) / batch_size)
+        
+        for i in range(0, len(stocks), batch_size):
+            batch = stocks[i:i+batch_size]
+            batch_num = i//batch_size + 1
+            
+            try:
+                # 批量获取换手率数据
+                q = query(
+                    valuation.code,
+                    valuation.turnover_ratio,
+                    valuation.day
+                ).filter(valuation.code.in_(batch))
+                
+                df = get_fundamentals_continuously(
+                    q, 
+                    end_date=query_date_str,
+                    count=max_days,
+                    panel=False
+                )
+                
+                if not df.empty:
+                    all_dfs.append(df)
+                
+                # 控制请求频率
+                if total_batches > 3 and batch_num % 3 == 0:
+                    time.sleep(1)
+                else:
+                    time.sleep(0.5)
+                    
+            except Exception as e:
+                log.warning(f"换手率批次{batch_num}失败: {str(e)}")
+                # 失败重试
+                for retry in range(2):
+                    try:
+                        time.sleep(2 * (retry + 1))
+                        df = get_fundamentals_continuously(
+                            q, 
+                            end_date=query_date_str,
+                            count=max_days,
+                            panel=False
+                        )
+                        if not df.empty:
+                            all_dfs.append(df)
+                        log.debug(f"换手率批次{batch_num}重试{retry+1}次成功")
+                        break
+                    except Exception as e2:
+                        log.warning(f"换手率批次{batch_num}重试{retry+1}次失败: {str(e2)}")
+        
+        if not all_dfs:
+            log.warning("换手率数据返回为空")
+            return pd.DataFrame()
+        
+        # 合并后转换为透视表
+        turnover_df = pd.concat(all_dfs, ignore_index=True)
+        return turnover_df.pivot(index='day', columns='code', values='turnover_ratio')
+    except Exception as e:
+        log.warning(f"换手率数据获取失败: {str(e)}")
+        return pd.DataFrame()
+
+def get_factor_data_batch(stocks, start_dt, end_dt, factors, debug, batch_size=100):
+    """批量获取因子数据（优化版，动态调整批次大小）"""
+    try:
+        if not stocks:
+            return {factor: pd.DataFrame() for factor in factors}
+        
+        # 确保日期是字符串类型
+        start_date_str = to_date_str(start_dt, "因子开始日期")
+        end_date_str = to_date_str(end_dt, "因子结束日期")
+            
+        if debug:
+            log.debug(f"批量获取因子数据 {factors}：{start_date_str}至{end_date_str}，股票数量={len(stocks)}")
+        
+        # 根据因子数量动态调整批次大小
+        adjusted_batch = max(50, int(batch_size / len(factors))) if factors else batch_size
+        
+        result = {factor: [] for factor in factors}
+        total_batches = math.ceil(len(stocks) / adjusted_batch)
+        
+        for i in range(0, len(stocks), adjusted_batch):
+            batch = stocks[i:i+adjusted_batch]
+            batch_num = i//adjusted_batch + 1
+            
+            if debug and batch_num % 5 == 0:
+                log.debug(f"处理因子批次 {batch_num}/{total_batches}，股票数量: {len(batch)}")
+            
+            try:
+                # 批量获取因子数据
+                factor_data = get_factor_values(
+                    securities=batch,
+                    factors=factors,
+                    start_date=start_date_str,
+                    end_date=end_date_str
+                )
+                
+                # 处理每个因子
+                for factor in factors:
+                    if factor in factor_data and not factor_data[factor].empty:
+                        df = factor_data[factor].stack().reset_index()
+                        df.columns = ['day', 'code', f'{factor}_value']
+                        df['day'] = pd.to_datetime(df['day'])
+                        result[factor].append(df)
+                
+                # 控制请求频率
+                if total_batches > 5 and batch_num % 5 == 0:
+                    time.sleep(1.5)
+                else:
+                    time.sleep(0.8)
+                    
+            except Exception as e:
+                log.warning(f"因子批次 {batch_num} 获取失败: {str(e)}")
+                # 失败重试
+                for retry in range(2):
+                    try:
+                        time.sleep(2 * (retry + 1))
+                        factor_data = get_factor_values(
+                            securities=batch,
+                            factors=factors,
+                            start_date=start_date_str,
+                            end_date=end_date_str
+                        )
+                        
+                        for factor in factors:
+                            if factor in factor_data and not factor_data[factor].empty:
+                                df = factor_data[factor].stack().reset_index()
+                                df.columns = ['day', 'code', f'{factor}_value']
+                                df['day'] = pd.to_datetime(df['day'])
+                                result[factor].append(df)
+                        
+                        log.debug(f"因子批次 {batch_num} 重试{retry+1}次成功")
+                        break
+                    except Exception as e2:
+                        log.warning(f"因子批次 {batch_num} 重试{retry+1}次失败: {str(e2)}")
+        
+        # 合并所有批次数据并转换为透视表
+        final_result = {}
+        for factor in factors:
+            if result[factor]:
+                combined_df = pd.concat(result[factor], ignore_index=True)
+                final_result[factor] = combined_df.pivot(index='day', columns='code', values=f'{factor}_value')
+            else:
+                final_result[factor] = pd.DataFrame()
+         # 如果包含 PEG 因子，移除 PEG 为空的记录，并同步更新其他因子
+        if 'PEG' in final_result and not final_result['PEG'].empty:
+            # 找出 PEG 非空的有效日期和股票代码组合
+            peg_notna = final_result['PEG'].notna()
+            valid_index = peg_notna.stack().index  # MultiIndex: (day, code)
+
+            # 用有效索引过滤所有因子
+            for factor in final_result:
+                if not final_result[factor].empty:
+                    final_result[factor] = final_result[factor].stack().reindex(valid_index).unstack(level=-1)
+        return final_result
+    except Exception as e:
+        log.error(f"因子数据获取失败: {str(e)}")
+        return {factor: pd.DataFrame() for factor in factors}
+
+
+# ==================== 主处理模块筛选（批量粗筛） ====================
+
+def filter_turnover_first(turnover_data, params):
+    """第一步：换手率批量筛选 - 使用市场分位数阈值"""   
+    if turnover_data.empty:
+        return {'remaining_stocks': []}
+    
+    # 计算全市场换手率分位数
+    market_turnover_series = turnover_data.mean()  # 每只股票的平均换手率
+    turnover_threshold = market_turnover_series.quantile(params['turnover_quantile'])
+    
+    # 有效数据量检查
+    valid_days = turnover_data.count()
+    valid_mask = valid_days >= params['min_valid_days']
+    
+    # 平均换手率检查（使用市场分位数阈值）
+    avg_turnover = turnover_data.mean()
+    turnover_mask = avg_turnover >= turnover_threshold
+    
+    # 综合筛选
+    pass_mask = valid_mask & turnover_mask
+    remaining_stocks = pass_mask[pass_mask].index.tolist()
+    
+    log.info(f"[主处理] 换手率筛选：使用{params['turnover_quantile']*100}%分位数阈值({turnover_threshold:.2f})，保留 {len(remaining_stocks)} 只股票")
+    return {
+        'remaining_stocks': remaining_stocks,
+        'stats': {
+            'avg_turnover': avg_turnover,
+            'turnover_threshold': turnover_threshold
+        }
+    }
+ 
+"""第二步：价格与流动性批量筛选"""
+def filter_price_liquidity(price_data, remaining_stocks, params):
+
+    if not remaining_stocks or not price_data:
+        return {'remaining_stocks': []}
+    
+    # 只保留价格数据中存在的股票
+    close_columns = price_data['close'].columns.tolist()
+    valid_stocks = get_common_stocks(remaining_stocks, close_columns)
+    
+    if len(valid_stocks) < len(remaining_stocks):
+        log.warning(f"[主处理] 价格数据缺失 {len(remaining_stocks)-len(valid_stocks)} 只股票，已过滤")
+    if not valid_stocks:
+        return {'remaining_stocks': []}
+    
+    # 批量计算筛选指标
+    close = price_data['close'][valid_stocks]
+    volume = price_data['volume'][valid_stocks]
+    high = price_data['high'][valid_stocks]
+    
+    valid_days = close.count()
+    valid_mask = valid_days >= params['min_valid_days']
+    
+    avg_volume = volume.tail(params['price_period']).mean() / 100
+    liquidity_mask = avg_volume >= params['min_avg_volume']
+    
+    recent_high = high.tail(params['price_period']).max()
+    current_p = close.iloc[-1]
+    max_drop = (current_p - recent_high) / recent_high * 100
+    drop_mask = max_drop >= -params['max_recent_drop']
+    
+    # 先定义初始的pass_mask
+    pass_mask = valid_mask & liquidity_mask & drop_mask
+    
+    # 现在可以安全地检查pass_mask了
+    if sum(pass_mask) < 10:
+        log.warning("价格流动性筛选结果过少，放宽条件")
+        liquidity_mask = avg_volume >= params['min_avg_volume'] * 0.5  # 降低流动性要求
+        drop_mask = max_drop >= -params['max_recent_drop'] * 1.5  # 放宽跌幅限制
+        # 重新计算pass_mask
+        pass_mask = valid_mask & liquidity_mask & drop_mask
+    
+    remaining_stocks = pass_mask[pass_mask].index.tolist()
+    
+    log.info(f"[主处理] 价格流动性筛选：保留 {len(remaining_stocks)} 只股票")
+    return {
+        'remaining_stocks': remaining_stocks,
+        'stats': {
+            'avg_volume': avg_volume,
+            'max_drop': max_drop
+        }
+    }
+  
+
+
+def filter_peg(peg_data, remaining_stocks, params, context):
+    """第三步：PEG因子批量筛选"""
+    # 初始化默认返回结构（确保所有分支都有'stats'）
+    default_stats = {'recent_peg': pd.Series()}
+    
+    # 情况1：PEG数据为空或无待筛选股票
+    if not remaining_stocks or peg_data.empty:
+        log.warning("PEG筛选：无待筛选股票或PEG数据为空")
+        return {
+            'remaining_stocks': [],
+            'stats': default_stats  # 即使无数据，也返回默认stats
+        }
+    
+    # 只保留PEG数据中存在的股票
+    peg_columns = peg_data.columns.tolist()
+    valid_stocks = get_common_stocks(remaining_stocks, peg_columns)
+    
+    # 情况2：有效股票为空
+    if not valid_stocks:
+        log.warning("PEG筛选：无有效股票（数据缺失）")
+        return {
+            'remaining_stocks': [],
+            'stats': default_stats
+        }
+    
+    # 情况3：有效股票数量少于待筛选股票（数据部分缺失）
+    if len(valid_stocks) < len(remaining_stocks):
+        log.warning(f"[主处理] PEG数据缺失 {len(remaining_stocks)-len(valid_stocks)} 只股票，已过滤")
+    
+    # --------------------------
+    # 正常筛选逻辑（不变）
+    # --------------------------
+    # 获取更精确的行业分类（使用申万一级行业）
+    try:
+        date_str = to_date_str(context.current_dt, "行业信息查询日期")
+        industry_info = get_industry(valid_stocks, date=date_str)
+    except Exception as e:
+        log.warning(f"获取行业信息失败: {str(e)}，使用缓存数据")
+        industry_info = {}
+    
+    # 按行业分组并计算行业PEG特性
+    industry_peg_thresholds = {}
+    industry_stocks = {}
+    for stock in valid_stocks:
+        # 行业分类逻辑（不变）
+        if stock in industry_info and 'sw_l1' in industry_info[stock]:
+            industry_code = industry_info[stock]['sw_l1']['industry_name']
+        else:
+            industry_code = get_industry_code(stock, context.current_dt)
+        
+        if industry_code not in industry_stocks:
+            industry_stocks[industry_code] = []
+        industry_stocks[industry_code].append(stock)
+    
+    # 行业PEG阈值映射（不变）
+    industry_peg_map = {
+        '计算机': 3.0,       # 含AI、云计算等，高研发投入，增长空间大
+        '电子': 2.8,         # 半导体、消费电子，技术迭代快，成长性突出
+        '国防军工': 2.8,     # 政策驱动强，长期增长确定性高
+        '医药生物': 2.7,     # 创新药、医疗器械，研发周期长但壁垒高
+        '传媒': 2.6,         # 含游戏、AI内容，流量变现能力决定估值
+        
+        # 中高成长行业（需求稳定，增长可见性强）
+        '电力设备': 2.5,     # 含新能源（光伏/锂电），碳中和长期逻辑支撑
+        '汽车': 2.3,         # 新能源汽车渗透率提升，智能化带来增量
+        '机械设备': 2.2,     # 高端制造、专精特新领域成长性突出
+        '通信': 2.2,         # 5G应用、算力网络，基础设施升级驱动
+        
+        # 中成长行业（消费属性强，盈利稳定）
+        '食品饮料': 2.0,     # 必选消费抗周期，龙头估值溢价
+        '家用电器': 1.9,     # 智能家居升级，全球化布局带来增长
+        '美容护理': 2.0,     # 消费升级驱动，品牌力决定成长性
+        '轻工制造': 1.8,     # 文具、家居用品，需求稳健
+        
+        # 周期成长行业（供需格局决定估值）
+        '有色金属': 1.8,     # 新能源上游（锂/铜）成长性优于传统金属
+        '化工': 1.7,         # 新材料领域具备高成长属性
+        '建筑材料': 1.6,     # 消费建材（瓷砖/涂料）具备品牌壁垒
+        '钢铁': 1.3,         # 特钢优于普钢，成长属性较弱
+        '采掘': 1.2,         # 能源转型背景下，成长性受限
+        
+        # 低成长行业（防御属性强，估值中枢低）
+        '银行': 1.1,         # 盈利稳定但增长缓慢，低估值常态化
+        '非银金融': 1.3,     # 券商受市场周期影响大，保险偏防御
+        '房地产': 1.2,       # 行业转型期，成长属性弱化
+        '公用事业': 1.1,     # 现金流稳定，估值波动小
+        '交通运输': 1.2,     # 物流/航空具备一定周期成长属性
+        
+        # 其他未明确分类行业
+        '其他': 2.1          # 取中高成长行业均值，略高于原方案
+        }
+    
+    # 计算各行业PEG阈值（不变）
+    for industry_code, stocks in industry_stocks.items():
+        if not stocks:
+            continue
+        industry_peg_values = []
+        for stock in stocks:
+            if stock in peg_data.columns:
+                recent_peg = peg_data[stock].dropna().tail(30).mean()
+                if not np.isnan(recent_peg) and recent_peg > 0:
+                    industry_peg_values.append(recent_peg)
+        
+        if industry_peg_values:
+            base_threshold = industry_peg_map.get(industry_code, industry_peg_map['其他'])
+            industry_median = np.median(industry_peg_values)
+            if industry_median > base_threshold * 1.5:
+                industry_threshold = min(base_threshold * 1.2, 3.0)
+            elif industry_median < base_threshold * 0.7:
+                industry_threshold = max(base_threshold * 0.8, 0.5)
+            else:
+                industry_threshold = base_threshold
+            industry_peg_thresholds[industry_code] = industry_threshold
+            log.debug(f"行业 {industry_code} PEG阈值: {industry_threshold:.2f} (基准: {base_threshold:.2f}, 中位数: {industry_median:.2f})")
+    
+    # 批量计算筛选指标（不变）
+    peg_subset = peg_data[valid_stocks]
+    recent_peg = peg_subset.tail(30).mean()  # 这是最终要返回的stats数据
+    
+    # 按行业应用阈值筛选（不变）
+    pass_mask = pd.Series(False, index=valid_stocks)
+    for stock in valid_stocks:
+        if stock in industry_info and 'sw_l1' in industry_info[stock]:
+            industry_code = industry_info[stock]['sw_l1']['industry_name']
+        else:
+            industry_code = get_industry_code(stock, context.current_dt)
+        
+        threshold = industry_peg_thresholds.get(industry_code, params['default_peg_threshold'])
+        if 0 < recent_peg[stock] <= threshold:
+            pass_mask[stock] = True
+    
+    remaining_stocks = pass_mask[pass_mask].index.tolist()
+    
+    # 放宽条件（如果结果过少）
+    if len(remaining_stocks) < 10:
+        log.warning("PEG筛选结果过少，放宽条件")
+        for stock in valid_stocks:
+            if stock not in remaining_stocks and 0 < recent_peg[stock] <= threshold * 1.5:
+                remaining_stocks.append(stock)
+    
+    log.info(f"[主处理] PEG因子筛选：保留 {len(remaining_stocks)} 只股票")
+    # 正常情况：返回包含实际recent_peg的stats
+    return {
+        'remaining_stocks': remaining_stocks,
+        'stats': {'recent_peg': recent_peg}  # 确保包含stats键
+    }
+
+"""第四步：CR20因子批量筛选 - 适配创业板特性（解决筛选为空问题）"""
+def filter_cr20(remaining_stocks, cr20_data, params, context, log):
+    # 边界条件处理
+    if not remaining_stocks or cr20_data.empty:
+        return {'remaining_stocks': []}
+    
+    # 过滤无CR20数据的股票
+    cr20_columns = cr20_data.columns.tolist()
+    valid_stocks = get_common_stocks(remaining_stocks, cr20_columns)
+    
+    if len(valid_stocks) < len(remaining_stocks):
+        log.warning(f"[主处理] CR20数据缺失 {len(remaining_stocks)-len(valid_stocks)} 只股票，已过滤")
+    if not valid_stocks:
+        return {'remaining_stocks': []}
+    
+    # --------------------------
+    # 关键优化：调用数据获取模块的get_stock_pool获取准确分类
+    # 替代原有的手动前缀识别逻辑，复用标准化分类
+    # --------------------------
+    # 获取创业板股票池（is_mainboard=False）
+    gem_pool = get_stock_pool(
+        context=context, 
+        debug=params.get('debug', False),  # 从参数中获取debug模式
+        is_mainboard=False, 
+        min_listed_days=params.get('min_listed_days', 365)  # 可从参数配置上市天数
+    )
+    # 获取非创业板股票池（is_mainboard=True）
+    non_gem_pool = get_stock_pool(
+        context=context, 
+        debug=params.get('debug', False),
+        is_mainboard=True,
+        min_listed_days=params.get('min_listed_days', 365)
+    )
+    
+    # 仅保留当前有效股票池中的创业板/非创业板股票（取交集）
+    gem_stocks = list(set(valid_stocks) & set(gem_pool))
+    non_gem_stocks = list(set(valid_stocks) & set(non_gem_pool))
+    
+    log.info(f"[创业板适配] 识别创业板股票 {len(gem_stocks)} 只，非创业板 {len(non_gem_stocks)} 只")
+    
+    # --------------------------
+    # 1. 获取行业信息（用于波动率调整）
+    # --------------------------
+    try:
+        date_str = to_date_str(context.current_dt, "行业信息查询日期")
+        industry_info = get_industry(valid_stocks, date=date_str)
+    except Exception as e:
+        log.warning(f"获取行业信息失败: {str(e)}，使用默认波动率阈值")
+        industry_info = {}
+    
+    # 按行业分组
+    industry_stocks = {}
+    for stock in valid_stocks:
+        industry_code = industry_info.get(stock, {}).get('sw_l1', {}).get('industry_name', '其他')
+        if industry_code not in industry_stocks:
+            industry_stocks[industry_code] = []
+        industry_stocks[industry_code].append(stock)
+    
+    # --------------------------
+    # 2. 批量计算核心指标
+    # --------------------------
+    cr20_subset = cr20_data[valid_stocks]
+    valid_days = cr20_subset.count()
+    valid_mask = valid_days >= params['cr20_long_period']  # 数据充足性（核心条件不放松）
+    
+    long_term = cr20_subset.tail(params['cr20_long_period']).mean()
+    short_term = cr20_subset.tail(params['cr20_short_period']).mean()
+    cr20_growth = (short_term - long_term) / long_term.replace(0, 1e-6) * 100  # 增长幅度
+    
+    # --------------------------
+    # 3. 波动率阈值：创业板单独放宽
+    # --------------------------
+    # 基础行业波动率阈值（非创业板）
+    base_vol_threshold = {
+        '有色金属': 25, '化工': 22, '钢铁': 20,
+        '计算机': 18, '电子': 18, '传媒': 18,
+        '食品饮料': 12, '家用电器': 12, '银行': 10,
+        '其他': 18
+    }
+    # 创业板波动率阈值（在基础上提高20%，适应更高波动）
+    gem_vol_threshold = {k: v * 1.2 for k, v in base_vol_threshold.items()}
+    
+    recent_window = cr20_subset.tail(params['cr20_stable_days'])
+    recent_mean = recent_window.mean()
+    recent_volatility = recent_window.std() / recent_mean.replace(0, 1e-6) * 100
+    
+    # 生成波动率掩码（区分创业板和非创业板）
+    is_stable = pd.Series(False, index=valid_stocks)
+    for stock in valid_stocks:
+        industry_code = industry_info.get(stock, {}).get('sw_l1', {}).get('industry_name', '其他')
+        # 创业板股票使用放宽后的阈值
+        if stock in gem_stocks:
+            threshold = gem_vol_threshold.get(industry_code, 18 * 1.2)  # 创业板默认阈值21.6
+        else:
+            threshold = base_vol_threshold.get(industry_code, 18)
+        is_stable[stock] = recent_volatility[stock] < threshold
+    
+    # --------------------------
+    # 4. 趋势条件：创业板更宽松
+    # --------------------------
+    trend_mask = pd.Series(False, index=valid_stocks)
+    for stock in valid_stocks:
+        recent_cr20 = cr20_subset[stock].dropna().tail(5)
+        if len(recent_cr20) < 5:
+            continue
+        
+        # 创业板：5天至少2天上升 + 整体趋势向上（比非创业板少1天要求）
+        # 非创业板：保持5天至少3天上升 + 整体趋势向上
+        if stock in gem_stocks:
+            min_increase_days = 2
+        else:
+            min_increase_days = 3
+        
+        increase_days = sum(recent_cr20.iloc[i] > recent_cr20.iloc[i-1] for i in range(1, 5))
+        overall_up = recent_cr20.iloc[-1] > recent_cr20.iloc[0]
+        
+        trend_mask[stock] = (increase_days >= min_increase_days) & overall_up
+    
+    # --------------------------
+    # 5. CR20范围：创业板扩大区间
+    # --------------------------
+    # 非创业板范围（核心+缓冲）
+    core_low = params['cr20_low_threshold']
+    core_high = params['cr20_high_threshold']
+    buffer_low = core_low * 0.9
+    buffer_high = core_high * 1.1
+    
+    # 创业板范围（核心区间扩大20%，缓冲带扩大至20%）
+    gem_core_low = core_low * 0.8  # 下限降低20%
+    gem_core_high = core_high * 1.2  # 上限提高20%
+    gem_buffer_low = gem_core_low * 0.8  # 缓冲下限再降20%
+    gem_buffer_high = gem_core_high * 1.2  # 缓冲上限再升20%
+    
+    # 生成范围掩码（区分创业板和非创业板）
+    range_mask = pd.Series(False, index=valid_stocks)
+    for stock in valid_stocks:
+        if stock in gem_stocks:
+            # 创业板：核心范围更宽，缓冲带更松
+            core_mask = (short_term[stock] > gem_core_low) & (short_term[stock] < gem_core_high)
+            buffer_mask = (short_term[stock] > gem_buffer_low) & (short_term[stock] < gem_buffer_high)
+            # 缓冲范围内只要有增长就通过（不要求1.2倍阈值）
+            range_mask[stock] = core_mask | (buffer_mask & (cr20_growth[stock] > 0))
+        else:
+            # 非创业板保持原逻辑
+            core_mask = (short_term[stock] > core_low) & (short_term[stock] < core_high)
+            buffer_mask = (short_term[stock] > buffer_low) & (short_term[stock] < buffer_high)
+            range_mask[stock] = core_mask | (buffer_mask & (cr20_growth[stock] > params['cr20_increase_threshold'] * 1.2))
+    
+    # --------------------------
+    # 6. 增长条件：创业板降低阈值
+    # --------------------------
+    # 非创业板：核心5% + 缓冲1.5%
+    core_growth = params['cr20_increase_threshold']
+    buffer_growth = core_growth * 0.3
+    
+    # 创业板：核心3%（降低40%） + 缓冲1%（降低33%）
+    gem_core_growth = core_growth * 0.6
+    gem_buffer_growth = core_growth * 0.2
+    
+    # 生成增长掩码
+    core_growth_mask = pd.Series(False, index=valid_stocks)
+    buffer_growth_mask = pd.Series(False, index=valid_stocks)
+    for stock in valid_stocks:
+        if stock in gem_stocks:
+            core_growth_mask[stock] = cr20_growth[stock] >= gem_core_growth
+            buffer_growth_mask[stock] = cr20_growth[stock] >= gem_buffer_growth
+        else:
+            core_growth_mask[stock] = cr20_growth[stock] >= core_growth
+            buffer_growth_mask[stock] = cr20_growth[stock] >= buffer_growth
+    
+    # --------------------------
+    # 7. 初始筛选
+    # --------------------------
+    pass_mask = valid_mask & range_mask & core_growth_mask & is_stable & trend_mask
+    remaining_stocks = pass_mask[pass_mask].index.tolist()
+    
+    # --------------------------
+    # 8. 放宽机制：创业板更早触发（优化核心）
+    # 新增判断：仅当存在创业板股票时才执行放宽逻辑
+    # --------------------------
+    # 全市场股票数量
+    total_market_stocks = get_total_market_stocks(context)
+    # 创业板股票总数少，放宽触发阈值更低（5只）
+    gem_relax_trigger = 5
+    non_gem_relax_trigger = 10 if total_market_stocks >= 3000 else 15
+    
+    # 分离创业板和非创业板的筛选结果，分别放宽
+    gem_remaining = [stock for stock in remaining_stocks if stock in gem_stocks]
+    non_gem_remaining = [stock for stock in remaining_stocks if stock in non_gem_stocks]
+    
+    # 创业板放宽逻辑（关键优化：仅当存在创业板股票时才执行）
+    if gem_stocks:  # 新增：只有创业板股票池非空时，才检查是否需要放宽
+        if len(gem_remaining) < gem_relax_trigger:
+            log.warning(f"[创业板放宽] 创业板筛选结果过少（{len(gem_remaining)}只），启动第一层放宽")
+            # 第一层：放松增长条件
+            gem_pass_mask = valid_mask & range_mask & buffer_growth_mask & is_stable & trend_mask
+            gem_remaining = gem_pass_mask[gem_pass_mask].index.intersection(gem_stocks).tolist()
+            
+            if len(gem_remaining) < gem_relax_trigger // 2:
+                log.warning(f"[创业板放宽] 仍过少（{len(gem_remaining)}只），启动第二层放宽（趋势再松）")
+                # 第二层：趋势条件再松（5天至少1天上升 + 整体向上）
+                gem_trend_mask = pd.Series(False, index=gem_stocks)
+                for stock in gem_stocks:
+                    recent_cr20 = cr20_subset[stock].dropna().tail(5)
+                    if len(recent_cr20) < 5:
+                        continue
+                    increase_days = sum(recent_cr20.iloc[i] > recent_cr20.iloc[i-1] for i in range(1, 5))
+                    overall_up = recent_cr20.iloc[-1] > recent_cr20.iloc[0]
+                    gem_trend_mask[stock] = (increase_days >= 1) & overall_up  # 仅需1天上升
+                    
+                gem_pass_mask = valid_mask & range_mask & buffer_growth_mask & is_stable & gem_trend_mask
+                gem_remaining = gem_pass_mask[gem_pass_mask].index.tolist()
+    else:
+        # 若创业板股票池为空，明确日志说明，不执行放宽
+        log.info(f"[创业板适配] 无创业板股票，不执行创业板放宽逻辑")
+    
+    # 非创业板保持原放宽逻辑
+    if len(non_gem_remaining) < non_gem_relax_trigger:
+        log.warning(f"[非创业板放宽] 筛选结果过少（{len(non_gem_remaining)}只），启动第一层放宽")
+        non_gem_pass_mask = valid_mask & range_mask & buffer_growth_mask & is_stable & trend_mask
+        non_gem_remaining = non_gem_pass_mask[non_gem_pass_mask].index.intersection(non_gem_stocks).tolist()
+    
+    # 合并结果
+    remaining_stocks = gem_remaining + non_gem_remaining
+    log.info(f"[主处理] CR20因子筛选完成：共保留 {len(remaining_stocks)} 只（创业板 {len(gem_remaining)} 只，非创业板 {len(non_gem_remaining)} 只）")
+    
+    return {
+        'remaining_stocks': remaining_stocks,
+        'stats': {
+            'cr20_short': short_term,
+            'cr20_long': long_term,
+            'cr20_growth': cr20_growth,
+            'cr20_volatility': recent_volatility
+        }
+    }
+    
+# ==================== 单股票详细筛选（精筛） ====================
+"""优化后的换手率脉冲筛选：强调信号质量和有效性"""
+def filter_turnover_pulse(df, params):
+        # 1. 计算基础指标
+    df['avg_turnover_30d'] = df['turnover'].rolling(params['turnover_period']).mean().fillna(0)  # 30天平均换手率
+    df['avg_volume_30d'] = df['volume'].rolling(params['turnover_period']).mean().fillna(0)      # 30天平均成交量
+    df['pct_change'] = df['close'].pct_change()                                                # 当日涨跌幅
+    df['stock_volatility'] = df['pct_change'].abs().rolling(120).mean().fillna(0.02)            # 120天平均波动率（默认2%）
+    
+    # 2. 基础脉冲信号识别
+    df['base_pulse'] = (
+        (df['avg_turnover_30d'] > params['min_turnover'] * 0.5) &  # 30天平均≥1.5%
+        (df['turnover'] >= params['min_turnover']) &               # 当日≥3%
+        (df['turnover'] >= df['avg_turnover_30d'] * 1.5) &         # 放量≥1.5倍
+        (df['turnover'] <= df['avg_turnover_30d'] * 3.5) &         # 非极端放量≤3.5倍
+        (df['pct_change'].abs() <= df['stock_volatility'] * 1.2) & # 动态涨跌幅限制
+        (df['volume'] >= df['avg_volume_30d'] * 1.3)               # 成交量同步放大
+    )
+    
+    # 3. 脉冲有效性验证（后续3天资金承接）
+    df['valid_pulse'] = False
+    # 提取基础脉冲的日期（Timestamp 类型）
+    pulse_dates = df[df['base_pulse']].index.tolist()
+    
+    for pulse_date in pulse_dates:
+        # 计算日期边界
+        end_date = pulse_date + pd.Timedelta(days=3)
+        # 基于日期索引筛选后续3天数据
+        post_pulse = df[(df.index > pulse_date) & (df.index <= end_date)]
+        
+        # 验证条件：至少1天换手率保持在1.2倍以上，且波动不大
+        has_sustained = (post_pulse['turnover'] >= df.loc[pulse_date, 'avg_turnover_30d'] * 1.2).any() if not post_pulse.empty else False
+        pulse_day_range = df.loc[pulse_date, 'high'] - df.loc[pulse_date, 'low']
+        post_range = (post_pulse['high'].max() - post_pulse['low'].min()) if not post_pulse.empty else 0
+        stable_after = (post_range <= pulse_day_range * 2)
+        
+        if has_sustained and stable_after:
+            df.loc[pulse_date, 'valid_pulse'] = True
+    
+    # 4. 筛选40天内的有效脉冲
+    end_date = df.index[-1]  # 最新日期（Timestamp）
+    start_date = end_date - pd.Timedelta(days=params['pulse_days'])  # 40天前日期
+    recent_df = df[(df.index >= start_date) & (df.index <= end_date)]
+    valid_pulses = recent_df[recent_df['valid_pulse']].index.tolist()
+    pulse_count = len(valid_pulses)
+    
+    if pulse_count < 2:
+        return 0, pulse_count  # 未达标，0分
+    
+    # 5. 验证脉冲分布合理性（间隔≥5天，至少1次在最近15天）
+    intervals = []
+    for i in range(len(valid_pulses)-1):
+        day_diff = (valid_pulses[i+1] - valid_pulses[i]).days
+        intervals.append(day_diff)
+    has_enough_interval = all(interval >= 5 for interval in intervals) if intervals else True
+    
+    # 最近15天的日期边界计算
+    recent_15d_start = end_date - pd.Timedelta(days=15)
+    has_recent_pulse = any(p_date >= recent_15d_start for p_date in valid_pulses)
+    
+    # 6. 评分：普通有效脉冲1分，优质脉冲2分
+    if has_enough_interval and has_recent_pulse:
+        return 2, pulse_count  # 优质脉冲，2分
+    else:
+        return 1, pulse_count  # 普通有效脉冲，1分
+
+"""单股票：价格低位筛选"""
+def filter_price_position(df, params):
+    # 1. 提取近期价格数据（默认120天）
+    price_period = params.get('price_period', 120)
+    recent_prices = df['close'].tail(price_period).dropna()
+    
+    # 数据量不足时直接返回不通过
+    if len(recent_prices) < price_period * 0.7:  # 至少70%的数据完整度
+        return False, 0.0
+    
+    # 2. 计算价格分位数（0-1，越低越接近近期低点）
+    min_p = recent_prices.min()
+    max_p = recent_prices.max()
+    current_p = recent_prices.iloc[-1]
+    price_range = max_p - min_p
+    
+    # 避免除以零（价格完全不变的极端情况）
+    if price_range < 1e-6:
+        price_quantile = 0.0  # 价格无波动，视为低位
+    else:
+        price_quantile = (current_p - min_p) / price_range
+    
+    # 3. 判断是否处于价格低位（分位数≤阈值，默认30%）
+    quantile_threshold = params.get('price_quantile_threshold', 0.3)
+    is_low = price_quantile <= quantile_threshold
+    
+    # 4. 判断是否处于整理期（近期振幅小，默认20天振幅<15%）
+    consolidation_days = params.get('consolidation_days', 20)
+    recent_consolidation = recent_prices.tail(consolidation_days)
+    consolidation_range = (recent_consolidation.max() - recent_consolidation.min()) / recent_consolidation.min()
+    in_consolidation = consolidation_range < 0.15  # 振幅<15%视为横盘
+    
+    # 5. 叠加估值验证（PE低于行业均值，避免价值陷阱）
+    if 'industry_pe' in df.columns and 'stock_pe' in df.columns:
+        industry_pe = df['industry_pe'].iloc[-1]
+        stock_pe = df['stock_pe'].iloc[-1]
+        is_low_valuation = not pd.isna(industry_pe) and not pd.isna(stock_pe) and (stock_pe < industry_pe * 0.8)
+    else:
+        is_low_valuation = True  # 无估值数据时不做额外限制
+    
+    # 综合判断：价格低位 + 横盘整理 + 低估值（如有数据）
+    pass_filter = is_low and in_consolidation and is_low_valuation
+    
+    # 返回筛选结果和价格分位数（百分比形式）
+    return pass_filter, round(price_quantile * 100, 2)
+
+"""单股票：均线趋势筛选"""
+def filter_ma_trend(df, params):
+    ma_periods = params['ma_periods']
+    ma_cols = [f'ma{p}' for p in ma_periods]
+    valid_ma = True
+    
+    # 计算各周期均线
+    for p in ma_periods:
+        if len(df) >= p * 0.9:
+            df[f'ma{p}'] = ta.SMA(df['close'].values, timeperiod=p)
+            df[f'ma{p}'] = df[f'ma{p}'].fillna(method='ffill')
+        else:
+            valid_ma = False
+    
+    if not (valid_ma and all(col in df.columns for col in ma_cols)):
+        return False, 0, None
+    
+    # 均线收敛度（越小越粘合）
+    mas = [df[col].iloc[-1] for col in ma_cols]
+    ma_spread = (max(mas) - min(mas)) / (min(mas) + 1e-6) * 100
+    
+    # 均线排列（短期在长期上方）
+    ma_ascending = (df['ma10'].iloc[-1] >= df['ma20'].iloc[-1] * 0.98) and (df['ma60'].iloc[-1] > df['ma60'].iloc[-5])  # 60日均线仍向上
+    
+    # 均线斜率变化（近期是否加速）
+    ma60_slope_current = calc_ma_slope(df['ma60'])
+    ma60_available = len(df) > params['ma_trend_period']
+    ma60_slope_past = calc_ma_slope(df['ma60'].iloc[:-params['ma_trend_period']]) if ma60_available else -10
+    slope_condition = (ma60_slope_current >= 1 and ma60_slope_past < ma60_slope_current * 0.5)
+    
+    # 评分（0-2分）
+    score = 0
+    if ma_spread <= params['ma_spread_threshold'] and ma_ascending:
+        score += 1
+    if slope_condition:
+        score += 1
+    
+    return True, score, {
+        'ma_spread': round(ma_spread, 1),
+        'ma60_slope': round(ma60_slope_current, 1)
+    }
+
+    """单股票：跑赢指数筛选（优化：用年化收益对比）"""
+def filter_outperform_index(close, price_period, index_data, index_code='399006.XSHE'):
+    try:
+        if index_data is None or len(index_data) < 2 or len(close) < price_period:
+            return False, 0
+        
+        # 计算年化收益（365天为一年）
+        stock_return = (close.iloc[-1] / close.iloc[-price_period] - 1) * (365 / price_period) * 100
+        index_return = (index_data['close'].iloc[-1] / index_data['close'].iloc[0] - 1) * (365 / price_period) * 100
+        outperform = round(stock_return - index_return, 1)
+        
+        return (stock_return > index_return), outperform
+    except:
+        return False, 0
+
+"""单股票处理函数，用于并行处理"""
+def process_single_stock(args):
+    stock, price_data, turnover_data, main_stats, params, index_data, index_code, debug = args
+    try:
+        # 1. 基础信息与主处理统计数据
+        stock_info = {
+            'code': stock,
+            'name': get_security_info(stock).display_name,
+            'avg_volume': round(main_stats['avg_volume'].get(stock, 0), 2),
+            'max_drop': round(main_stats['max_drop'].get(stock, 0), 2),
+            'avg_turnover': round(main_stats['avg_turnover'].get(stock, 0), 2),
+            'recent_peg': round(main_stats['recent_peg'].get(stock, 0), 2),
+            'cr20_short': round(main_stats['cr20_short'].get(stock, 0), 1),
+            'cr20_long': round(main_stats['cr20_long'].get(stock, 0), 1),
+            'cr20_growth': round(main_stats['cr20_growth'].get(stock, 0), 1),
+            'cr20_volatility': round(main_stats['cr20_volatility'].get(stock, 0), 1)
+        }
+        
+        # 基础分（主处理通过分）
+        score = 2
+        
+        # 2. 提取单股票数据
+        close = price_data['close'][stock].dropna()
+        volume = price_data['volume'][stock].dropna()
+        high = price_data['high'][stock].dropna()
+        low = price_data['low'][stock].dropna()
+        turnover = turnover_data[stock].dropna() if stock in turnover_data.columns else pd.Series()
+        
+        # 数据合并与清洗
+        close.index = pd.to_datetime(close.index)
+        turnover.index = pd.to_datetime(turnover.index)
+        start_date = min(close.index.min(), turnover.index.min()) if not turnover.empty else close.index.min()
+        end_date = max(close.index.max(), turnover.index.max()) if not turnover.empty else close.index.max()
+        full_index = pd.date_range(start=start_date, end=end_date)
+        
+        df = pd.DataFrame({
+            'close': close.reindex(full_index),
+            'high': high.reindex(full_index),
+            'low': low.reindex(full_index),
+            'turnover': turnover.reindex(full_index).fillna(0),
+            'volume': volume.reindex(full_index)
+        }).fillna(method='ffill', limit=3).fillna(method='bfill', limit=3).dropna(subset=['close'])
+        
+        # 数据量检查（不足则直接淘汰）
+        required_days = max(params['price_period'], params['pulse_days'] + params['turnover_period'])
+        if len(df) < int(required_days * params['merge_tolerance']):
+            if debug:
+                log.debug(f"[单股票] {stock} 数据量不足，淘汰")
+            return None
+        
+        # 3. 详细筛选条件（逐个计算并评分）
+        # 3.1 换手率脉冲筛选
+        pulse_score, pulse_count = filter_turnover_pulse(df, params)
+        stock_info['pulse_count'] = pulse_count
+        score += pulse_score
+        if pulse_score > 0 and debug:
+            log.debug(f"[单股票] {stock} 换手率脉冲达标，+{pulse_score}分")
+        
+        # 3.2 价格低位筛选
+        price_pass, price_quantile = filter_price_position(df, params)
+        stock_info['price_quantile'] = price_quantile
+        if price_pass:
+            score += 1
+            if debug:
+                log.debug(f"[单股票] {stock} 价格低位达标，+1分")
+        
+        # 3.3 均线趋势筛选
+        ma_pass, ma_score, ma_data = filter_ma_trend(df, params)
+        if ma_pass:
+            score += ma_score
+            if debug:
+                log.debug(f"[单股票] {stock} 均线趋势达标，+{ma_score}分")
+        if ma_data:
+            stock_info.update(ma_data)
+        
+        # 3.4 跑赢指数筛选
+        index_pass, outperform = filter_outperform_index(
+            close, params['price_period'], index_data, index_code
+        )
+        stock_info['outperform_index'] = outperform
+        if index_pass:
+            score += 1
+            if debug:
+                log.debug(f"[单股票] {stock} 跑赢指数，+1分")
+        
+        # 4. 最终评分
+        stock_info['score'] = score
+        if score >= params['pass_score']:
+            if debug:
+                log.debug(f"[单股票] {stock} 总得分 {score}，达标")
+            return stock_info
+        else:
+            if debug:
+                log.debug(f"[单股票] {stock} 总得分 {score}，未达标")
+            return None
+            
+    except Exception as e:
+        log.error(f"[单股票] 处理 {stock} 出错: {str(e)}")
+        return None
+
+
+# ==================== 筛选流程控制器 ====================
+"""筛选流程总控制器：先主处理批量筛选，再单股票详细筛选"""
+def run_screening_pipeline(stock_pool, price_data, turnover_data, factor_data, params, index_data, index_code, debug, context):
+    start_time = time.time()
+    total_initial = len(stock_pool)
+    log.info(f"\n===== 开始筛选流程（初始股票数：{total_initial}） =====")
+    
+    # --------------------------
+    # 第一阶段：主处理模块批量筛选
+    # --------------------------
+    main_stats = {}  # 保存主处理阶段的统计数据，供单股票筛选复用
+    
+    # 1. 换手率筛选
+    turnover_result = filter_turnover_first(turnover_data, params)
+    main_stats['avg_turnover'] = turnover_result['stats']['avg_turnover']
+    if not turnover_result['remaining_stocks']:
+        log.info("主处理筛选：换手率筛选后无剩余股票，终止流程")
+        return []
+    
+    # 2. 价格流动性筛选
+    price_result = filter_price_liquidity(price_data, turnover_result['remaining_stocks'], params)
+    main_stats['avg_volume'] = price_result['stats']['avg_volume']
+    main_stats['max_drop'] = price_result['stats']['max_drop']
+    if not price_result['remaining_stocks']:
+        log.info("主处理筛选：价格流动性筛选后无剩余股票，终止流程")
+        return []
+    
+    # 3. PEG因子筛选
+    peg_result = filter_peg(factor_data.get('PEG', pd.DataFrame()), price_result['remaining_stocks'], params, context)
+    # 安全检查：确保peg_result包含'stats'键，且'stats'包含'recent_peg'
+    if 'stats' not in peg_result or 'recent_peg' not in peg_result['stats']:
+        log.warning("PEG筛选结果格式异常，使用默认空数据")
+        main_stats['recent_peg'] = pd.Series()
+    else:
+        main_stats['recent_peg'] = peg_result['stats']['recent_peg']
+    # 无剩余股票时终止流程
+    if not peg_result['remaining_stocks']:
+        log.info("主处理筛选：PEG筛选后无剩余股票，终止流程")
+        return []
+    
+    # 4. CR20因子筛选
+    # 调整参数顺序，并补充context和log参数
+    cr20_result = filter_cr20(
+        remaining_stocks=peg_result['remaining_stocks'],  # 第一个参数：待筛选股票列表
+        cr20_data=factor_data.get('CR20', pd.DataFrame()),  # 第二个参数：CR20数据
+        params=params,  # 第三个参数：参数配置
+        context=context,  # 补充：上下文对象（策略运行时的环境信息）
+        log=log  # 补充：日志对象（用于输出日志）
+    )
+    main_stats['cr20_short'] = cr20_result['stats']['cr20_short']
+    main_stats['cr20_long'] = cr20_result['stats']['cr20_long']
+    main_stats['cr20_growth'] = cr20_result['stats']['cr20_growth']
+    main_stats['cr20_volatility'] = cr20_result['stats']['cr20_volatility']
+    final_main_stocks = cr20_result['remaining_stocks']
+    
+    log.info(f"\n===== 主处理筛选完成（剩余股票数：{len(final_main_stocks)}） =====")
+    if not final_main_stocks:
+        return []
+    
+    # --------------------------
+    # 第二阶段：单股票详细筛选（并行处理）
+    # --------------------------
+    qualified_stocks = []
+    log.info(f"\n===== 开始单股票详细筛选（待筛选数：{len(final_main_stocks)}） =====")
+    
+    # 准备并行处理的参数
+    process_args = [
+        (stock, price_data, turnover_data, main_stats, params, index_data, index_code, debug)
+        for stock in final_main_stocks
+    ]
+    
+    # 控制线程池大小，避免资源耗尽
+    worker_count = min(MAX_WORKERS, len(process_args))
+    
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        # 提交所有任务
+        futures = {executor.submit(process_single_stock, args): args[0] for args in process_args}
+        
+        # 处理结果
+        for i, future in enumerate(as_completed(futures), 1):
+            stock = futures[future]
+            try:
+                result = future.result()
+                if result:
+                    qualified_stocks.append(result)
+                
+                # 打印进度
+                if i % 10 == 0 or i == len(process_args):
+                    log.info(f"单股票筛选进度：{i}/{len(process_args)}，已合格：{len(qualified_stocks)}")
+                    
+            except Exception as e:
+                log.error(f"处理股票 {stock} 时发生异常: {str(e)}")
+    
+    # 如果最终合格股票太少，降低合格分数线
+    if len(qualified_stocks) < 3 and len(final_main_stocks) >= 10:
+        log.warning("最终合格股票太少，降低合格分数线重新筛选")
+        for stock_data in process_args:
+            # 重新处理未达标的股票
+            result = process_single_stock(stock_data)
+            if result and result['score'] >= params['pass_score'] * 0.8:
+                qualified_stocks.append(result)
+        # 去重
+        qualified_stocks = list({s['code']: s for s in qualified_stocks}.values())
+    
+    # 筛选结果汇总
+    log.info(f"\n===== 筛选流程结束 =====")
+    log.info(f"初始股票数：{total_initial} → 主处理后：{len(final_main_stocks)} → 最终合格：{len(qualified_stocks)}")
+    log.info(f"总耗时：{time.time() - start_time:.2f}秒")
+    
+    return qualified_stocks
+
+
+# ==================== 策略主函数 ====================
+"""策略初始化：统一参数配置与定时任务，确保与后续函数参数对齐"""
+def initialize(context):
+    # 全局参数配置（与后续筛选、交易函数所需参数严格对应）
+    g.params = {
+        # 价格/换手率/因子等核心筛选参数
+        'price_period': 120,                # 与process_stock_universe的价格数据周期匹配
+        'turnover_period': 30,              # 与get_turnover_data的计算周期匹配
+        'cr20_long_period': 30,             # 与process_stock_universe的因子周期匹配
+        'turnover_quantile': 0.4,           # 关键：补充该参数，解决KeyError
+        'pulse_days': 40,                   # 关键：补充该参数，解决KeyError（脉冲检测周期，天）
+        'min_turnover': 3,                  # 关键：补充该参数，解决KeyError（最低换手率阈值，通常为3%）
+        
+        # 止损止盈参数（与check_stop_condition直接关联）
+        'stop_loss_ratio': 0.10,            # 止损比例（10%）
+        'take_profit_ratio': 0.60,          # 止盈比例（60%）
+        'max_portfolio_drawdown': 15,       # 与execute_trade的全局回撤控制匹配
+         
+        # 流动性/数据质量参数（新增/恢复min_valid_days）
+        'min_avg_volume': 5000,             # 最低平均成交量（手）
+        'min_valid_days': 15,               # 关键：补充该参数，解决KeyError（最低有效数据天数）
+         
+        # 交易执行参数（与execute_trade直接关联）
+        'max_position': 5,                  # 最大持仓数量
+        'transaction_cost_rate': 0.0015,    # 佣金率（统一管理，避免硬编码）
+        'min_commission': 5,                # 最低佣金
+        
+        # 价格相关参数（新增/恢复max_recent_drop）
+        'price_period': 120,                # 价格分析周期（天）
+        'price_quantile_threshold': 0.3,    # 价格低位分位数阈值
+        'max_recent_drop': 30,              # 关键：补充该参数，解决KeyError（最大近期跌幅，单位%）
+        
+        # PEG因子参数（新增/恢复default_peg_threshold）
+        'default_peg_threshold': 2.0,       # 关键：补充该参数，解决KeyError（默认PEG阈值）
+     
+        # CR20因子核心参数（新增/恢复cr20_short_period）
+        'cr20_short_period': 10,            # 关键：补充该参数，解决KeyError（短期周期，天）
+        'cr20_long_period': 30,             # 长期周期（天）
+        'cr20_low_threshold': 60,           # 低位阈值（超卖区）
+        'cr20_high_threshold': 140,         # 高位阈值（超买区）
+        'cr20_increase_threshold': 10,      # 增长阈值（%）
+        'cr20_stable_days': 5,              # 稳定性检查周期（天）
+        
+         # 均线参数（新增/恢复ma_periods）
+        'ma_periods': [10, 20, 60, 120],    # 关键：补充该参数，解决KeyError（均线周期设置，单位：天）
+        'ma_spread_threshold': 10,          # 均线最大发散度（%）
+        'ma_trend_period': 40,              # 均线趋势对比周期（天）
+        
+        # 系统参数
+        'debug': True,
+        'rebalance_monthday': 6,           # 调仓日（统一在此配置，便于维护）
+        'merge_tolerance': 0.6,             # 关键：补充该参数，解决KeyError（数据合并容忍度，0-1之间）
+        'max_position': 5,                  # 最大持仓数量
+        'pass_score': 5,                    # 合格分数线
+        }
+    
+    # 计算所需最大历史数据天数（为process_stock_universe提供数据范围依据）
+    g.max_hist_days = max(
+        g.params['price_period'],
+        g.params['turnover_period'],
+        g.params['cr20_long_period']
+    )
+    
+    # 初始化状态变量（供select_and_adjust和check_market_status共享）
+    g.last_rebalance_day = None
+    
+    # 注册定时任务（调仓日与参数保持一致）
+    run_monthly(select_and_adjust, monthday=g.params['rebalance_monthday'], time='open')
+    run_daily(check_market_status, time='open')  # 每日监控与调仓逻辑分离
+    
+    # 初始化日志（明确参数关联关系）
+    log.info(f"策略初始化完成：每月{g.params['rebalance_monthday']}日调仓，最大持仓{g.params['max_position']}只")
+    log.info(f"止损比例: {g.params['stop_loss_ratio']*100}%，止盈比例: {g.params['take_profit_ratio']*100}%")
+
+"""精简止损止盈判断：移除未使用的context参数，专注核心判断逻辑"""
+def check_stop_condition(stock, buy_price, current_price, params):
+    change_ratio = (current_price - buy_price) / buy_price * 100
+    # 直接使用传入的params（与initialize中的配置严格对应）
+    stop_loss = current_price < buy_price * (1 - params['stop_loss_ratio'])
+    take_profit = current_price > buy_price * (1 + params['take_profit_ratio'])
+    
+    # 日志格式统一，便于后续分析
+    if stop_loss:
+        log.info(f"[止损触发] {stock} - 买入价:{buy_price:.2f}, 当前价:{current_price:.2f}, 跌幅:{change_ratio:.2f}%")
+    elif take_profit:
+        log.info(f"[止盈触发] {stock} - 买入价:{buy_price:.2f}, 当前价:{current_price:.2f}, 涨幅:{change_ratio:.2f}%")
+    
+    return stop_loss or take_profit
+
+"""调仓主函数：优化流程衔接，确保与筛选/交易函数的数据格式兼容"""
+def select_and_adjust(context):
+    current_dt = context.current_dt
+    current_date = current_dt.date()  # 统一日期格式为date类型，便于后续计算
+    date_str = current_date.strftime('%Y-%m-%d')
+    params = g.params  # 直接使用全局参数，避免重复传递
+    
+    log.info("="*80)
+    log.info(f"【{date_str}】开始月度调仓（与initialize配置的{params['rebalance_monthday']}日一致）")
+    
+    # 1. 计算因子数据范围（与process_stock_universe的参数需求匹配）
+    factor_start_date = (current_date - pd.Timedelta(days=params['cr20_long_period'] + 15)).strftime('%Y-%m-%d')
+    factor_end_date = date_str
+    
+    # 2. 筛选创业板和主板股票（结果格式统一为含'code'和'score'的字典列表）
+    gem_qualified = process_stock_universe(
+        context, is_mainboard=False, 
+        start_date=factor_start_date, end_date=factor_end_date,
+        index_code='399006.XSHE'  # 创业板指
+    )
+    mainboard_qualified = process_stock_universe(
+        context, is_mainboard=True, 
+        start_date=factor_start_date, end_date=factor_end_date,
+        index_code='000001.XSHG'  # 上证指数
+    )
+    
+    # 3. 合并结果并执行调仓（确保数据格式被execute_trade正确解析）
+    all_qualified = gem_qualified + mainboard_qualified
+    if all_qualified:
+        log.info(f"创业板+主板共筛选出{len(all_qualified)}只合格股票，执行调仓")
+        execute_trade(context, all_qualified, current_dt, current_date)
+    else:
+        log.info("无合格股票，执行空仓操作")
+        clear_all_positions(context)  # 提取空仓逻辑为独立函数，增强复用
+    
+    # 更新全局状态（供check_market_status参考）
+    g.last_rebalance_day = current_date
+    log.info(f"【{date_str}】月度调仓完成")
+    log.info("="*80)
+
+"""筛选函数：统一参数接口，确保输出格式与execute_trade兼容"""
+def process_stock_universe(context, is_mainboard, start_date, end_date, index_code):
+    params = g.params
+    debug = params['debug']
+    # 1. 获取基础股票池（与select_and_adjust的市场类型参数对应）
+    stock_pool = get_stock_pool(
+        context, debug, 
+        is_mainboard=is_mainboard, 
+        min_listed_days=365
+    )
+    if not stock_pool:
+        log.info(f"{'主板' if is_mainboard else '创业板'}股票池为空，跳过筛选")
+        return []
+    
+    # 2. 分步获取数据（严格按依赖顺序，减少无效计算）
+    turnover_data = get_turnover_data(stock_pool, context.current_dt.date(), g.max_hist_days, debug)
+    if turnover_data.empty:
+        log.error(f"{'主板' if is_mainboard else '创业板'}换手率数据获取失败")
+        return []
+    
+    # 3. 执行筛选（确保输出为含'code'和'score'的字典列表，与execute_trade要求一致）
+    stocks_after_turnover = filter_turnover_first(turnover_data, params)['remaining_stocks']
+    if not stocks_after_turnover:
+        return []
+    
+    # 4. 补充其他数据并完成最终筛选
+    price_data = batch_get_price_data(stocks_after_turnover, context.current_dt, g.max_hist_days, debug)
+    factor_data = get_factor_data_batch(
+        stocks_after_turnover, start_date, end_date, ['PEG', 'CR20'], debug
+    )
+    index_data = get_price(
+        index_code, end_date=context.current_dt, 
+        count=params['price_period'], frequency='daily'
+    )
+    
+    # 5. 返回标准化结果（确保每个元素含'code'和'score'，供execute_trade排序使用）
+    return run_screening_pipeline(
+        stocks_after_turnover, price_data, turnover_data, factor_data,
+        params, index_data, index_code, debug, context
+    )
+
+"""交易执行函数：与筛选结果格式对齐，复用全局参数"""
+def execute_trade(context, qualified_stocks, current_dt, current_date):
+    params = g.params
+    date_str = current_date.strftime('%Y-%m-%d')
+    start_time = time.time()
+    
+    # 1. 验证筛选结果格式（确保与process_stock_universe的输出兼容）
+    if not all(isinstance(stock, dict) and 'code' in stock and 'score' in stock for stock in qualified_stocks):
+        log.error("筛选结果格式错误，必须包含'code'和'score'字段")
+        return
+    
+    # 2. 止损止盈（直接复用check_stop_condition，参数严格对应）
+    current_holdings = set(context.portfolio.positions.keys())
+    for stock_code in current_holdings:
+        position = context.portfolio.positions[stock_code]
+        if position.total_amount <= 0:
+            continue
+        
+        current_price = get_price(stock_code, end_date=current_dt, fields='close', count=1)['close'].iloc[-1]
+        if check_stop_condition(stock_code, position.avg_cost, current_price, params):
+            order_target_value(stock_code, 0)
+            log.info(f"[止损/止盈执行] 卖出{stock_code}")
+    
+    # 3. 全局回撤控制（使用全局参数，与initialize配置一致）
+    if check_portfolio_drawdown(context, params):
+        log.info("触发全局回撤控制，调仓终止")
+        return
+    
+    # 4. 市场状态适配（结果直接用于持仓数量计算）
+    state_params = get_market_state_params(context, current_dt)
+    log.info(f"当前市场状态：{state_params['state']}，最大持仓{state_params['max_position']}只")
+    
+    # 5. 筛选最终标的（与process_stock_universe的评分字段对应）
+    final_selected = sorted(qualified_stocks, key=lambda x: x['score'], reverse=True)[:state_params['max_position']]
+    target_holdings = {stock['code'] for stock in final_selected}
+    
+    # 6. 执行买卖操作（复用统一的交易参数）
+    execute_sell_operations(context, current_holdings - target_holdings)
+    execute_buy_operations(
+        context, final_selected, target_holdings - current_holdings,
+        state_params['max_cash_ratio'], params
+    )
+    
+    # 7. 调仓总结（与check_market_status的监控维度呼应）
+    log.info(f"【调仓总结】耗时{time.time()-start_time:.2f}秒，最终持仓{len(final_selected)}只")
+
+"""监控函数：与调仓函数共享状态变量，数据维度对齐"""
+def check_market_status(context):
+    current_dt = context.current_dt
+    date_str = current_dt.strftime('%Y-%m-%d')
+    
+    log.info(f"\n【市场监控】{date_str}（上次调仓日：{g.last_rebalance_day or '未调仓'}）")
+    
+    # 1. 指数监控（与process_stock_universe的指数代码对应）
+    monitor_indices = {
+        '399006.XSHE': '创业板指',
+        '000001.XSHG': '上证指数'
+    }
+    for code, name in monitor_indices.items():
+        show_index_status(code, name, current_dt)
+    
+    # 2. 持仓监控（与execute_trade的最终持仓对应）
+    show_position_details(context, current_dt)
+    
+    # 3. 资产概况（与execute_trade的资金计算逻辑一致）
+    total_asset = context.portfolio.total_value
+    cash_ratio = context.portfolio.cash / total_asset * 100
+    log.info(f"【资产概况】总资产: {total_asset:.2f}元, 现金占比: {cash_ratio:.2f}%")
+    log.info("="*80)
+
+"""空仓操作：提取为独立函数，供select_and_adjust复用"""
+# 以下为新增的辅助函数，增强核心函数的复用性和协作性
+def clear_all_positions(context):
+
+    for stock in context.portfolio.positions:
+        position = context.portfolio.positions[stock]
+        if position.total_amount > 0:
+            order_target_value(stock, 0)
+            log.info(f"空仓操作：卖出{stock} {position.total_amount}股")
+
+"""组合回撤检查：提取为独立函数，供execute_trade复用"""
+def check_portfolio_drawdown(context, params):
+    portfolio = context.portfolio
+    if not (hasattr(portfolio, 'max_total_value') and portfolio.max_total_value > 0):
+        return False
+    
+    max_drawdown = (portfolio.max_total_value - portfolio.total_value) / portfolio.max_total_value * 100
+    if max_drawdown > params['max_portfolio_drawdown']:
+        log.warning(f"组合最大回撤{max_drawdown:.2f}%，超过阈值{params['max_portfolio_drawdown']}%")
+        for stock in context.portfolio.positions:
+            position = context.portfolio.positions[stock]
+            if position.total_amount > 0:
+                order_target_percent(stock, 0.3 / len(context.portfolio.positions))
+        return True
+    return False
+
+"""市场状态参数：提取为独立函数，供execute_trade复用"""
+def get_market_state_params(context, current_dt):
+    index_code = '399006.XSHE'
+    index_data = get_price(index_code, end_date=current_dt, count=60)
+    index_state = get_market_state(index_code, index_data)
+    
+    state_params = {
+        "downtrend_high_vol": {"max_position": 3, "max_cash_ratio": 0.5, "state": "下跌高波动"},
+        "downtrend_low_vol": {"max_position": 4, "max_cash_ratio": 0.3, "state": "下跌低波动"},
+        "uptrend_high_vol": {"max_position": 6, "max_cash_ratio": 0.1, "state": "上涨高波动"},
+        "uptrend_low_vol": {"max_position": 5, "max_cash_ratio": 0.2, "state": "上涨低波动"},
+        "neutral": {"max_position": 5, "max_cash_ratio": 0.2, "state": "中性"}
+    }
+    return state_params.get(index_state, state_params["neutral"])
+
+"""卖出操作：提取为独立函数，简化execute_trade"""
+def execute_sell_operations(context, to_sell):
+    log.info(f"[卖出操作] 共{len(to_sell)}只股票")
+    for stock in to_sell:
+        position = context.portfolio.positions[stock]
+        if position.total_amount > 0:
+            order_target_value(stock, 0)
+            log.info(f"  卖出{stock}：{position.total_amount}股，市值{position.value:.2f}元")
+
+"""买入操作：提取为独立函数，简化execute_trade"""
+def execute_buy_operations(context, final_selected, to_buy, max_cash_ratio, params):
+    total_cash = context.portfolio.total_value
+    total_invest = total_cash * (1 - max_cash_ratio)
+    target_value_per_stock = total_invest / len(final_selected) if final_selected else 0
+    
+    log.info(f"[买入操作] 共{len(to_buy)}只股票，单只目标市值{target_value_per_stock:.2f}元")
+    for stock in final_selected:
+        code = stock['code']
+        if code not in to_buy:
+            continue
+        
+        current_price = get_price(code, end_date=context.current_dt, fields='close', count=1)['close'].iloc[-1]
+        valid_qty = calculate_valid_quantity(target_value_per_stock, current_price)
+        actual_value = valid_qty * current_price
+        commission = max(actual_value * params['transaction_cost_rate'], params['min_commission'])
+        
+        if actual_value + commission <= total_cash:
+            order_target_value(code, actual_value)
+            log.info(f"  买入{code}：{valid_qty}股，市值{actual_value:.2f}元，佣金{commission:.2f}元")
+        else:
+            log.warning(f"  资金不足，跳过买入{code}")
+
+"""指数状态展示：辅助check_market_status，格式统一"""
+def show_index_status(code, name, current_dt):
+    try:
+        price_data = get_price(code, end_date=current_dt, fields=['close'], count=2)
+        if len(price_data) >= 2:
+            prev_close = price_data['close'].iloc[-2]
+            current_close = price_data['close'].iloc[-1]
+            change_ratio = (current_close - prev_close) / prev_close * 100
+            log.info(f"  {name}({code})：{current_close:.2f}元，涨跌幅{change_ratio:.2f}%")
+    except Exception as e:
+        log.warning(f"  获取{name}数据失败：{str(e)}")
+
+"""持仓详情展示：辅助check_market_status，与execute_trade的持仓逻辑对应"""
+def show_position_details(context, current_dt):
+    valid_holdings = {
+        code: pos for code, pos in context.portfolio.positions.items()
+        if pos.total_amount > 0
+    }
+    log.info(f"【持仓详情】共{len(valid_holdings)}只股票")
+    
+    if valid_holdings:
+        log.info(f"  {'代码':<10} {'名称':<10} {'数量(股)':<10} {'成本价':<8} {'当前价':<8} {'盈亏(%)':<8}")
+        for code, pos in valid_holdings.items():
+            try:
+                stock_name = get_security_info(code).display_name if 'get_security_info' in globals() else '未知'
+                current_price = get_price(code, end_date=current_dt, fields='close', count=1)['close'].iloc[-1]
+                profit_ratio = (current_price - pos.avg_cost) / pos.avg_cost * 100 if pos.avg_cost > 0 else 0
+                log.info(
+                    f"  {code:<10} {stock_name:<10} {pos.total_amount:<10} "
+                    f"{pos.avg_cost:.2f}    {current_price:.2f}    {profit_ratio:+.2f}%"
+                )
+            except Exception as e:
+                log.warning(f"  获取{code}详情失败：{str(e)}")
+
